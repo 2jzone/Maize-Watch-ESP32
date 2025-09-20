@@ -1,0 +1,359 @@
+#include "DHT.h"
+#include "RTClib.h"
+#include "Wire.h"
+
+// --- Sensor Pins ---
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define SOIL_PIN 35
+#define LDR_PIN 34
+
+// --- I2C Pins for RTC ---
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// --- DHT and RTC Objects ---
+DHT dht(DHTPIN, DHTTYPE);
+RTC_DS3231 rtc;
+
+// --- Air780E Serial ---
+#define AIR_TX 17
+#define AIR_RX 16
+HardwareSerial Air780E(1);
+
+// --- ThingSpeak Configuration ---
+String apiKey = "NPMLX7W903SDFAZP";
+String server = "api.thingspeak.com";
+
+// --- Sleep Schedule Configuration ---
+const int NIGHT_MODE_START = 20;  // 8:00 PM (20:00)
+const int NIGHT_MODE_END = 3;     // 3:00 AM (03:00)
+const unsigned long DAY_INTERVAL = 15000;    // 15 seconds (day mode)
+const unsigned long NIGHT_INTERVAL = 3600000; // 1 hour (night mode)
+
+// --- Function Prototypes ---
+String sendAT(String cmd, int delayMs);
+bool initNetwork();
+bool ensureNetwork();
+bool sendHTTPData(String urlParams);
+bool isNightMode();
+unsigned long getCurrentInterval();
+void printCurrentTime();
+
+// --- Send AT Command Helper ---
+String sendAT(String cmd, int delayMs) {
+  Air780E.println(cmd);
+  Serial.print("➡️ AT: ");
+  Serial.println(cmd);
+  delay(delayMs);
+  
+  String resp = "";
+  while (Air780E.available()) {
+    resp += (char)Air780E.read();
+  }
+  
+  if (resp.length() > 0) {
+    Serial.println(resp);
+  }
+  return resp;
+}
+
+// --- Initialize Network using SAPBR ---
+bool initNetwork() {
+  Serial.println("🚀 Initializing Air780E network (SAPBR method)...");
+
+  // SIM check
+  String resp = sendAT("AT+CPIN?", 1000);
+  if (resp.indexOf("READY") == -1) {
+    Serial.println("❌ SIM not ready!");
+    return false;
+  }
+
+  // Signal strength check
+  resp = sendAT("AT+CSQ", 1000);
+  if (resp.indexOf("+CSQ:") == -1) {
+    Serial.println("❌ No signal!");
+    return false;
+  }
+
+  // Wait for network registration
+  Serial.println("⏳ Waiting for network registration...");
+  for (int i = 0; i < 10; i++) {
+    resp = sendAT("AT+CREG?", 1000);
+    if (resp.indexOf("0,1") != -1 || resp.indexOf("0,5") != -1) {
+      Serial.println("✅ Network registered!");
+      break;
+    }
+    delay(2000);
+  }
+
+  // Final registration check
+  resp = sendAT("AT+CREG?", 1000);
+  if (resp.indexOf("0,1") == -1 && resp.indexOf("0,5") == -1) {
+    Serial.println("❌ Network registration failed!");
+    return false;
+  }
+
+  // Attach to GPRS
+  resp = sendAT("AT+CGATT?", 1000);
+  if (resp.indexOf("+CGATT: 1") == -1) {
+    Serial.println("⚠ Attaching to GPRS...");
+    sendAT("AT+CGATT=1", 5000);
+    delay(2000);
+  }
+
+  // Setup GPRS bearer using SAPBR
+  Serial.println("🌐 Setting up GPRS connection...");
+  
+  sendAT("AT+SAPBR=0,1", 2000);  // Close any existing bearer
+  delay(1000);
+
+  sendAT("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"", 1000);
+  sendAT("AT+SAPBR=3,1,\"APN\",\"smartlte\"", 1000);
+
+  // Open GPRS bearer
+  Serial.println("📡 Opening GPRS bearer...");
+  resp = sendAT("AT+SAPBR=1,1", 10000);
+  
+  if (resp.indexOf("OK") != -1) {
+    delay(2000);
+    resp = sendAT("AT+SAPBR=2,1", 2000);
+    if (resp.indexOf("1,1,") != -1) {
+      Serial.println("✅ GPRS bearer connected!");
+      return true;
+    }
+  }
+  
+  Serial.println("❌ GPRS connection failed!");
+  return false;
+}
+
+// --- Ensure Network Connection ---
+bool ensureNetwork() {
+  Serial.println("📡 Checking GPRS bearer...");
+  String resp = sendAT("AT+SAPBR=2,1", 2000);
+  
+  if (resp.indexOf("1,1,") != -1) {
+    Serial.println("✅ GPRS bearer active.");
+    return true;
+  }
+  
+  Serial.println("⚠ GPRS bearer lost, reinitializing...");
+  return initNetwork();
+}
+
+// --- Send HTTP Data to ThingSpeak ---
+bool sendHTTPData(String urlParams) {
+  Serial.println("🌐 Sending HTTP request...");
+  
+  // Initialize HTTP service
+  String resp = sendAT("AT+HTTPINIT", 2000);
+  if (resp.indexOf("OK") == -1) {
+    Serial.println("❌ HTTP init failed!");
+    sendAT("AT+HTTPTERM", 1000); // Clean up
+    return false;
+  }
+
+  // Set bearer profile and URL
+  sendAT("AT+HTTPPARA=\"CID\",1", 1000);
+  
+  String fullUrl = "http://" + server + "/update?api_key=" + apiKey + urlParams;
+  sendAT("AT+HTTPPARA=\"URL\",\"" + fullUrl + "\"", 1000);
+  
+  Serial.println("📤 URL: " + fullUrl);
+
+  // Send GET request
+  resp = sendAT("AT+HTTPACTION=0", 15000);
+  
+  bool success = false;
+  
+  // Check for successful HTTP responses (200, 302, etc.)
+  if (resp.indexOf("+HTTPACTION: 0,200,") != -1) {
+    Serial.println("✅ HTTP GET successful (200 OK)!");
+    success = true;
+  } else if (resp.indexOf("+HTTPACTION: 0,302,") != -1) {
+    Serial.println("✅ HTTP GET successful (302 Redirect - ThingSpeak accepted data)!");
+    success = true;
+  } else if (resp.indexOf("+HTTPACTION: 0,") != -1) {
+    // Extract status code for debugging
+    int statusStart = resp.indexOf("+HTTPACTION: 0,") + 15;
+    int statusEnd = resp.indexOf(",", statusStart);
+    if (statusEnd > statusStart) {
+      String statusCode = resp.substring(statusStart, statusEnd);
+      Serial.println("⚠ HTTP Response Code: " + statusCode);
+      
+      // Accept 2xx and 3xx status codes as successful
+      int code = statusCode.toInt();
+      if (code >= 200 && code < 400) {
+        Serial.println("✅ HTTP request successful (status " + statusCode + ")!");
+        success = true;
+      } else {
+        Serial.println("❌ HTTP request failed with status " + statusCode);
+      }
+    } else {
+      Serial.println("❌ HTTP GET failed - unknown response format");
+      Serial.println("Response: " + resp);
+    }
+  } else {
+    Serial.println("❌ HTTP GET failed - no response received");
+    Serial.println("Response: " + resp);
+  }
+  
+  // Always close HTTP service
+  sendAT("AT+HTTPTERM", 1000);
+  return success;
+}
+
+// --- Check if current time is in night mode ---
+bool isNightMode() {
+  if (!rtc.begin()) {
+    Serial.println("⚠ RTC not available, using day mode");
+    return false;
+  }
+  
+  DateTime now = rtc.now();
+  int currentHour = now.hour();
+  
+  // Night mode: 8:00 PM to 3:00 AM
+  if (currentHour >= NIGHT_MODE_START || currentHour < NIGHT_MODE_END) {
+    return true;
+  }
+  
+  return false;
+}
+
+// --- Get current interval based on time ---
+unsigned long getCurrentInterval() {
+  if (isNightMode()) {
+    Serial.println("🌙 Night mode: 1-hour interval");
+    return NIGHT_INTERVAL;
+  } else {
+    Serial.println("☀️ Day mode: 15-second interval");
+    return DAY_INTERVAL;
+  }
+}
+
+// --- Print current time from RTC ---
+void printCurrentTime() {
+  if (!rtc.begin()) {
+    Serial.println("⚠ RTC not available");
+    return;
+  }
+  
+  DateTime now = rtc.now();
+  Serial.printf("🕒 Current Time: %02d:%02d:%02d %02d/%02d/%04d\n",
+                now.hour(), now.minute(), now.second(),
+                now.day(), now.month(), now.year());
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("🚀 ESP32 Agriculture Monitor with RTC Sleep Schedule");
+  
+  // Initialize I2C for RTC
+  Wire.begin(SDA_PIN, SCL_PIN);
+  
+  // Initialize RTC
+  if (!rtc.begin()) {
+    Serial.println("❌ Couldn't find RTC! Check wiring.");
+  } else {
+    Serial.println("✅ RTC initialized");
+    
+    // Check if RTC lost power and needs time reset
+    if (rtc.lostPower()) {
+      Serial.println("⚠ RTC lost power, setting time to compile time");
+      rtc.adjust(DateTime(__DATE__, __TIME__));
+    }
+  }
+  
+  // Initialize DHT sensor
+  dht.begin();
+  Serial.println("✅ DHT11 initialized");
+  
+  // Initialize Air780E
+  Air780E.begin(115200, SERIAL_8N1, AIR_RX, AIR_TX);
+  Serial.println("✅ Air780E serial initialized");
+  
+  delay(5000); // Give module time to boot
+  
+  // Module diagnostics
+  Serial.println("🔍 Module diagnostics...");
+  sendAT("AT", 1000);
+  sendAT("AT+CIMI", 1000);
+  sendAT("AT+CCID", 1000);
+  sendAT("AT+COPS?", 2000);
+  
+  // Clean HTTP state at startup
+  Serial.println("🧹 Cleaning HTTP state...");
+  sendAT("AT+HTTPTERM", 1000);
+  
+  // Initialize network
+  if (!initNetwork()) {
+    Serial.println("❌ Network init failed. Will retry in main loop.");
+  }
+  
+  Serial.println("🎯 System initialized! Starting sensor monitoring...\n");
+}
+
+void loop() {
+  // Print current time and mode
+  printCurrentTime();
+  
+  // Read DHT11 sensor
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+  
+  if (isnan(humidity) || isnan(temperature)) {
+    Serial.println("❌ Failed to read DHT11! Retrying in 5 seconds...");
+    delay(5000);
+    return;
+  }
+  
+  // Read analog sensors
+  int soilRaw = analogRead(SOIL_PIN);
+  int soilMoisture = map(soilRaw, 4095, 0, 0, 100);
+  
+  int ldrRaw = analogRead(LDR_PIN);
+  int lightValue = ldrRaw * 10;
+  
+  float soilPH = 7.0; // Mock pH value
+  
+  // Display sensor readings
+  Serial.println("━━━━━━ 🌱 SENSOR READINGS 🌱 ━━━━━━");
+  Serial.printf("🌡️  Temperature: %.2f°C\n", temperature);
+  Serial.printf("💧 Humidity: %.2f%%\n", humidity);
+  Serial.printf("🌱 Soil Moisture: %d%%\n", soilMoisture);
+  Serial.printf("☀️  Light Level: %d\n", lightValue);
+  Serial.printf("⚗️  Soil pH: %.1f\n", soilPH);
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  
+  // Build URL parameters for ThingSpeak
+  String urlParams = "&field1=" + String(temperature) +
+                     "&field2=" + String(humidity) +
+                     "&field3=" + String(soilMoisture) +
+                     "&field4=" + String(soilPH) +
+                     "&field5=" + String(lightValue);
+  
+  // Send data to ThingSpeak
+  if (ensureNetwork()) {
+    if (sendHTTPData(urlParams)) {
+      Serial.println("🎉 Data uploaded successfully!");
+    } else {
+      Serial.println("🚨 Upload failed! Will retry next cycle.");
+    }
+  } else {
+    Serial.println("🚨 Network connection failed!");
+  }
+  
+  // Get appropriate delay based on current time
+  unsigned long delayTime = getCurrentInterval();
+  
+  if (delayTime == NIGHT_INTERVAL) {
+    Serial.printf("😴 Entering night mode sleep for %lu minutes...\n", delayTime / 60000);
+  } else {
+    Serial.printf("⏰ Next reading in %lu seconds...\n", delayTime / 1000);
+  }
+  
+  Serial.println("────────────────────────────────────────\n");
+  delay(delayTime);
+}
